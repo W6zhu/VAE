@@ -1,1 +1,5 @@
 .DS_Store
+modified_gan_nii.ipynb
+loss_plots.png
+results.png
+training_losses.png
