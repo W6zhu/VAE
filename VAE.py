@@ -18,6 +18,7 @@ import h5py  # For saving models as .h5 files
 
 # Import the lr_scheduler
 from torch.optim import lr_scheduler
+import torchvision.models as models  # For perceptual loss
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -77,17 +78,17 @@ class PairedNIIDataset(Dataset):
         anatomical_slice = anatomical_slice * mask_slice
         fatfraction_slice = fatfraction_slice * mask_slice
 
-        # Normalize each slice to [0, 1]
+        # Normalize each slice to [-1, 1]
         # Handle potential division by zero when max value is zero
         max_val_anatomical = anatomical_slice.max()
         if max_val_anatomical > 0:
-            anatomical_slice = anatomical_slice / max_val_anatomical
+            anatomical_slice = (anatomical_slice / max_val_anatomical) * 2 - 1
         else:
             anatomical_slice = anatomical_slice  # Slice remains zeros
 
         max_val_fatfraction = fatfraction_slice.max()
         if max_val_fatfraction > 0:
-            fatfraction_slice = fatfraction_slice / max_val_fatfraction
+            fatfraction_slice = (fatfraction_slice / max_val_fatfraction) * 2 - 1
         else:
             fatfraction_slice = fatfraction_slice  # Slice remains zeros
 
@@ -129,49 +130,83 @@ class Encoder(nn.Module):
         return mu, logvar
 
 
+# Modified Generator to use U-Net architecture
 class Generator(nn.Module):
     def __init__(self, latent_dim=100, output_channels=1):
         super(Generator, self).__init__()
         self.fc = nn.Linear(latent_dim, 256 * 8 * 8)
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # Output: 16x16
+
+        # Encoder (downsampling path)
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),  # 8x8
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),  # 8x8 -> 4x4
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+
+        # Decoder (upsampling path)
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),  # 4x4 -> 8x8
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.dec2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),   # 8x8 -> 16x16
             nn.BatchNorm2d(128),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),   # Output: 32x32
+            nn.ReLU(inplace=True)
+        )
+        self.dec3 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),    # 16x16 -> 32x32
             nn.BatchNorm2d(64),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),    # Output: 64x64
+            nn.ReLU(inplace=True)
+        )
+        self.dec4 = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),     # 32x32 -> 64x64
             nn.BatchNorm2d(32),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_channels, kernel_size=4, stride=2, padding=1),  # Output: 128x128
-            nn.Sigmoid()  # Output range [0, 1]
+            nn.ReLU(inplace=True)
+        )
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(32, output_channels, kernel_size=4, stride=2, padding=1),  # 64x64 -> 128x128
+            nn.Tanh()  # Output range [-1, 1]
         )
 
     def forward(self, z):
         x = self.fc(z)
         x = x.view(z.size(0), 256, 8, 8)
-        return self.deconv(x)
+
+        enc1 = self.enc1(x)  # 8x8
+        enc2 = self.enc2(enc1)  # 4x4
+
+        dec1 = self.dec1(enc2)  # 8x8
+        dec1 = dec1 + enc1  # Skip connection
+
+        dec2 = self.dec2(dec1)  # 16x16
+        dec3 = self.dec3(dec2)  # 32x32
+        dec4 = self.dec4(dec3)  # 64x64
+        out = self.final(dec4)  # 128x128
+
+        return out
 
 
 class Discriminator(nn.Module):
     def __init__(self, input_channels=1):
         super(Discriminator, self).__init__()
         self.main = nn.Sequential(
-            nn.Conv2d(input_channels, 32, kernel_size=4, stride=2, padding=1),  # Output: 64x64
+            nn.Conv2d(input_channels, 16, kernel_size=4, stride=2, padding=1),  # Reduced filters
             nn.LeakyReLU(0.2, inplace=True),
-            # Optionally reduce the capacity by commenting out a layer
-            # nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),  # Output: 32x32
-            # nn.BatchNorm2d(64),
-            # nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, 128, kernel_size=4, stride=2, padding=1),  # Adjusted layer
-            nn.BatchNorm2d(128),
+            nn.Conv2d(16, 32, kernel_size=4, stride=2, padding=1),  # Output: 32x32
+            nn.BatchNorm2d(32),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # Output: 16x16
-            nn.BatchNorm2d(256),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),  # Output: 16x16
+            nn.BatchNorm2d(64),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Flatten(),
-            nn.Linear(256 * 16 * 16, 1),  # Adjusted input size due to layer change
-            nn.Sigmoid()
+            nn.Linear(64 * 16 * 16, 1),  # Adjusted input size
+            # No activation for WGAN-GP
         )
 
     def forward(self, x):
@@ -191,20 +226,40 @@ def display_images(anatomical, fat_fraction, reconstructed, generated, epoch, de
 
     for ax, img, title in zip(axes, images, titles):
         img = img.to(device)
-        im = ax.imshow(img.detach().squeeze().cpu().numpy(), cmap="gray")
+        img = (img + 1) / 2  # Rescale from [-1, 1] to [0, 1] for visualization
+        im = ax.imshow(img.detach().squeeze().cpu().numpy(), cmap="gray", vmin=0, vmax=1)
         ax.axis("off")
         ax.set_title(f"{title}")
         fig.colorbar(im, ax=ax)
 
     plt.tight_layout()
-    filename = f"results.png"
+    filename = f"gan run 2000 optimize 2/results_epoch_{epoch+1}.png"
     plt.savefig(filename)
     plt.close()
 
 
+# Function to compute gradient penalty
+def compute_gradient_penalty(D, real_samples, fake_samples):
+    alpha = torch.rand(real_samples.size(0), 1, 1, 1, device=device)
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+    d_interpolates = D(interpolates)
+    fake = torch.ones(d_interpolates.size(), device=device)
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=fake,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
 if __name__ == '__main__':
     # Training loop parameters
-    num_epochs = 2  # Adjust as needed
+    num_epochs = 2000  # Adjust as needed
     batch_size = 32  # Adjust as needed
     latent_dim = 100  # Dimension of the latent space for the generator
 
@@ -241,24 +296,39 @@ if __name__ == '__main__':
     discriminator = Discriminator().to(device)
 
     # Loss functions
-    criterion_gan = nn.BCELoss()
     criterion_recon = nn.MSELoss()
 
+    # Load pre-trained VGG16 model for perceptual loss
+    vgg = models.vgg16(pretrained=True).features[:16].to(device).eval()
+    for param in vgg.parameters():
+        param.requires_grad = False
+
     # Adjusted learning rates and weight decay
-    optimizer_E = optim.Adam(encoder.parameters(), lr=0.0001, betas=(0.5, 0.999), weight_decay=1e-5)
-    optimizer_G = optim.Adam(generator.parameters(), lr=0.0002, betas=(0.5, 0.999), weight_decay=1e-5)  # Increased LR
-    optimizer_D = optim.Adam(discriminator.parameters(), lr=0.00005, betas=(0.5, 0.999), weight_decay=1e-5)  # Decreased LR
+    optimizer_E = optim.Adam(encoder.parameters(), lr=0.0001, betas=(0.5, 0.999))
+    optimizer_G = optim.Adam(generator.parameters(), lr=0.0001, betas=(0.5, 0.999))
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))  # Reduced LR
 
     # Learning rate schedulers
     scheduler_E = lr_scheduler.CosineAnnealingLR(optimizer_E, T_max=num_epochs)
     scheduler_G = lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=num_epochs)
     scheduler_D = lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=num_epochs)
 
+    # Loss weights
+    adversarial_weight = 1.0
+    recon_weight = 50.0
+    kl_weight = 0.01
+    perceptual_weight = 0.1
+    tv_weight = 0.1
+
     # Initialize lists to store losses
     d_losses = []
     g_losses = []
     recon_losses = []
     kl_losses = []
+    gp_losses = []  # To store gradient penalty values
+
+    n_critic = 5  # Number of discriminator updates per generator update
+    lambda_gp = 10  # Gradient penalty coefficient
 
     # Training Loop
     for epoch in range(num_epochs):
@@ -270,95 +340,122 @@ if __name__ == '__main__':
         epoch_g_loss = 0.0
         epoch_recon_loss = 0.0
         epoch_kl_loss = 0.0
+        epoch_gp_loss = 0.0
         num_batches = 0
 
-        for anatomical_image, real_fatfraction_image, _ in train_loader:
+        for i, (anatomical_image, real_fatfraction_image, _) in enumerate(train_loader):
             # Move images to device
             anatomical_image = anatomical_image.to(device, non_blocking=True)
             real_fatfraction_image = real_fatfraction_image.to(device, non_blocking=True)
 
             # -------- Train Discriminator --------
-            optimizer_D.zero_grad()
-            
-            # Real images with label smoothing
-            real_labels = torch.full((real_fatfraction_image.size(0), 1), 0.9, device=device)
-            output_real = discriminator(real_fatfraction_image)
-            loss_real = criterion_gan(output_real, real_labels)
+            for _ in range(n_critic):
+                optimizer_D.zero_grad()
 
-            # Fake images
-            mu, logvar = encoder(anatomical_image)
-            z = reparameterize(mu, logvar)
-            fake_fatfraction_image = generator(z)
-            fake_labels = torch.zeros((real_fatfraction_image.size(0), 1), device=device)
-            output_fake = discriminator(fake_fatfraction_image.detach())
-            loss_fake = criterion_gan(output_fake, fake_labels)
+                # Generate fake images
+                mu, logvar = encoder(anatomical_image)
+                z = reparameterize(mu, logvar)
+                fake_fatfraction_image = generator(z).detach()
 
-            # Discriminator loss and update
-            loss_D = (loss_real + loss_fake) * 0.5
-            loss_D.backward()
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-            optimizer_D.step()
+                # Real and fake scores
+                real_validity = discriminator(real_fatfraction_image)
+                fake_validity = discriminator(fake_fatfraction_image)
+
+                # Compute gradient penalty
+                gradient_penalty = compute_gradient_penalty(discriminator, real_fatfraction_image.data, fake_fatfraction_image.data)
+
+                # Wasserstein loss
+                d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + lambda_gp * gradient_penalty
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=10.0)
+                optimizer_D.step()
+
+                # Accumulate losses
+                epoch_d_loss += d_loss.item()
+                epoch_gp_loss += gradient_penalty.item()
+                num_batches += 1
 
             # -------- Train Generator and Encoder --------
             optimizer_E.zero_grad()
             optimizer_G.zero_grad()
-            
+
+            # Generate fake images
+            mu, logvar = encoder(anatomical_image)
+            z = reparameterize(mu, logvar)
+            fake_fatfraction_image = generator(z)
+
             # Adversarial loss for generator
-            output = discriminator(fake_fatfraction_image)
-            gan_loss = criterion_gan(output, real_labels)  # Use real_labels to encourage generator to produce real-like images
-            gan_loss_weight = 1.0  # Set to 1.0
-            gan_loss = gan_loss * gan_loss_weight
+            fake_validity = discriminator(fake_fatfraction_image)
+            g_adv_loss = -torch.mean(fake_validity) * adversarial_weight
 
             # Reconstruction loss and KL-divergence loss
-            recon_loss_weight = 1.0
-            recon_loss = criterion_recon(fake_fatfraction_image, real_fatfraction_image) * recon_loss_weight
+            recon_loss = criterion_recon(fake_fatfraction_image, real_fatfraction_image) * recon_weight
             kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
             kl_loss /= anatomical_image.size(0) * 128 * 128
+            kl_loss *= kl_weight
+
+            # Perceptual loss
+            def perceptual_loss(gen_images, real_images):
+                gen_images_rgb = gen_images.repeat(1, 3, 1, 1)  # Convert grayscale to RGB
+                real_images_rgb = real_images.repeat(1, 3, 1, 1)
+                gen_features = vgg(gen_images_rgb)
+                real_features = vgg(real_images_rgb)
+                loss = F.l1_loss(gen_features, real_features)
+                return loss
+
+            p_loss = perceptual_loss(fake_fatfraction_image, real_fatfraction_image) * perceptual_weight
+
+            # Total variation loss
+            def total_variation_loss(img):
+                loss = torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])) + \
+                       torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]))
+                return loss
+
+            tv_loss = total_variation_loss(fake_fatfraction_image) * tv_weight
 
             # Total generator and encoder loss
-            loss_G = gan_loss + recon_loss + kl_loss
+            loss_G = g_adv_loss + recon_loss + kl_loss + p_loss + tv_loss
             loss_G.backward()
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
-            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=10.0)
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=10.0)
             optimizer_E.step()
             optimizer_G.step()
 
             # Accumulate losses
-            epoch_d_loss += loss_D.item()
             epoch_g_loss += loss_G.item()
             epoch_recon_loss += recon_loss.item()
             epoch_kl_loss += kl_loss.item()
-            num_batches += 1
 
         # Step the schedulers at the end of the epoch
         scheduler_E.step()
         scheduler_G.step()
         scheduler_D.step()
 
-        # Optional: Print the current learning rates
-        current_lr_E = optimizer_E.param_groups[0]['lr']
-        current_lr_G = optimizer_G.param_groups[0]['lr']
-        current_lr_D = optimizer_D.param_groups[0]['lr']
+        # End of epoch timing
+        end_time = time.time()
+        epoch_duration = end_time - start_time
 
         # Calculate average losses for the epoch
-        avg_d_loss = epoch_d_loss / num_batches
+        avg_d_loss = epoch_d_loss / (num_batches * n_critic)
         avg_g_loss = epoch_g_loss / num_batches
         avg_recon_loss = epoch_recon_loss / num_batches
         avg_kl_loss = epoch_kl_loss / num_batches
+        avg_gp_loss = epoch_gp_loss / (num_batches * n_critic)
 
         d_losses.append(avg_d_loss)
         g_losses.append(avg_g_loss)
         recon_losses.append(avg_recon_loss)
         kl_losses.append(avg_kl_loss)
-
-        # End of epoch timing
-        end_time = time.time()
-        epoch_duration = end_time - start_time
+        gp_losses.append(avg_gp_loss)
 
         # Print losses, learning rates, and epoch duration
         print(f"Epoch [{epoch+1}/{num_epochs}], Duration: {epoch_duration:.2f}s, "
               f"D Loss: {avg_d_loss:.4f}, G Loss: {avg_g_loss:.4f}, "
-              f"Recon Loss: {avg_recon_loss:.4f}, KL Loss: {avg_kl_loss:.4f}")
+              f"Recon Loss: {avg_recon_loss:.4f}, KL Loss: {avg_kl_loss:.4f}, "
+              f"GP: {avg_gp_loss:.4f}")
+        current_lr_E = optimizer_E.param_groups[0]['lr']
+        current_lr_G = optimizer_G.param_groups[0]['lr']
+        current_lr_D = optimizer_D.param_groups[0]['lr']
         print(f"Learning Rates - LR_E: {current_lr_E:.6f}, LR_G: {current_lr_G:.6f}, LR_D: {current_lr_D:.6f}")
 
         # Save images every few epochs
@@ -378,6 +475,7 @@ if __name__ == '__main__':
         plt.plot(range(1, len(g_losses) + 1), g_losses, label="Generator Loss")
         plt.plot(range(1, len(recon_losses) + 1), recon_losses, label="Reconstruction Loss")
         plt.plot(range(1, len(kl_losses) + 1), kl_losses, label="KL Divergence Loss")
+        plt.plot(range(1, len(gp_losses) + 1), gp_losses, label="Gradient Penalty")
         plt.xlabel("Epochs")
         plt.ylabel("Loss")
         plt.legend()
@@ -385,7 +483,7 @@ if __name__ == '__main__':
         plt.savefig(f"training_losses.png")
         plt.close()
 
-        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axs = plt.subplots(3, 2, figsize=(12, 15))
 
         # Plot each loss on a separate subplot
         axs[0, 0].plot(d_losses, label='Discriminator Loss', color='red')
@@ -415,6 +513,13 @@ if __name__ == '__main__':
         axs[1, 1].set_ylabel('Loss')
         axs[1, 1].legend()
         axs[1, 1].grid(True)
+
+        axs[2, 0].plot(gp_losses, label='Gradient Penalty', color='orange')
+        axs[2, 0].set_title('Gradient Penalty')
+        axs[2, 0].set_xlabel('Epochs')
+        axs[2, 0].set_ylabel('Loss')
+        axs[2, 0].legend()
+        axs[2, 0].grid(True)
 
         plt.tight_layout()
         plt.savefig("loss_plots.png")  # Save the plot to a file
@@ -452,6 +557,9 @@ if __name__ == '__main__':
             volume_id = volume_ids[0]  # Since batch_size=1
             real_slice = real_fatfraction_image[0].cpu().numpy().reshape(-1)
             pred_slice = fake_fatfraction_image[0].cpu().numpy().reshape(-1)
+
+            # Rescale predicted slice from [-1, 1] to [0, 1] for metric calculation
+            pred_slice = (pred_slice + 1) / 2  # Rescale to [0, 1]
 
             # Mask out zero values (non-liver regions)
             mask = real_slice > 0  # Assuming zero indicates non-liver

@@ -29,3 +29,7 @@ training_losses_epoch_1.png
 training_losses_epoch_2.png
 gan.ipynb
 gan.ipynb
+~$test_results.xlsx
+/gan run 2000 optimize/
+/gan run 2000 optimize 2/
+/gan run 2500/
