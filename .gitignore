@@ -33,3 +33,7 @@ gan.ipynb
 /gan run 2000 optimize/
 /gan run 2000 optimize 2/
 /gan run 2500/
+gan_run_results_epoch_10.png
+gan_run_results_epoch_15.png
+gan_run_results_epoch_20.png
+gan_run_results_epoch_5.png

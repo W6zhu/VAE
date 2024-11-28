@@ -220,9 +220,9 @@ def reparameterize(mu, logvar):
 
 
 def display_images(anatomical, fat_fraction, reconstructed, generated, epoch, device):
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-    images = [anatomical, fat_fraction, reconstructed, generated]
-    titles = ["Original Anatomical", "Original Fat Fraction", "Reconstructed", "Generated"]
+    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+    images = [anatomical, fat_fraction, generated]
+    titles = ["Original Anatomical", "Original Fat Fraction", "Generated"]
 
     for ax, img, title in zip(axes, images, titles):
         img = img.to(device)
@@ -233,7 +233,7 @@ def display_images(anatomical, fat_fraction, reconstructed, generated, epoch, de
         fig.colorbar(im, ax=ax)
 
     plt.tight_layout()
-    filename = f"gan run 2000 optimize 2/results_epoch_{epoch+1}.png"
+    filename = f"gan_run_results_epoch_{epoch+1}.png"
     plt.savefig(filename)
     plt.close()
 
@@ -259,7 +259,7 @@ def compute_gradient_penalty(D, real_samples, fake_samples):
 
 if __name__ == '__main__':
     # Training loop parameters
-    num_epochs = 2000  # Adjust as needed
+    num_epochs = 20  # Adjust as needed
     batch_size = 32  # Adjust as needed
     latent_dim = 100  # Dimension of the latent space for the generator
 
@@ -459,7 +459,7 @@ if __name__ == '__main__':
         print(f"Learning Rates - LR_E: {current_lr_E:.6f}, LR_G: {current_lr_G:.6f}, LR_D: {current_lr_D:.6f}")
 
         # Save images every few epochs
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 5 == 0:
             display_images(
                 anatomical_image[0],
                 real_fatfraction_image[0],
@@ -563,8 +563,20 @@ if __name__ == '__main__':
 
             # Mask out zero values (non-liver regions)
             mask = real_slice > 0  # Assuming zero indicates non-liver
+
+            # Debugging statements
+            print(f"Volume ID: {volume_id}")
+            print(f"Real slice shape: {real_slice.shape}")
+            print(f"Unique values in real_slice: {np.unique(real_slice)}")
+            print(f"Mask sum (number of non-zero elements): {np.sum(mask)}")
+
             real_slice = real_slice[mask]
             pred_slice = pred_slice[mask]
+
+            # Check if slices are empty after masking
+            if real_slice.size == 0 or pred_slice.size == 0:
+                print(f"Empty slice after masking for Volume ID: {volume_id}")
+                continue  # Skip this slice or handle accordingly
 
             # Initialize lists if not present
             if volume_id not in real_values_per_volume:
@@ -581,10 +593,22 @@ if __name__ == '__main__':
         real_values = np.array(real_values_per_volume[volume_id])
         pred_values = np.array(pred_values_per_volume[volume_id])
 
-        real_median = np.median(real_values)
-        real_iqr = np.subtract(*np.percentile(real_values, [75, 25]))
-        pred_median = np.median(pred_values)
-        pred_iqr = np.subtract(*np.percentile(pred_values, [75, 25]))
+        # Handle empty arrays
+        if len(real_values) > 0:
+            real_median = np.median(real_values)
+            real_iqr = np.subtract(*np.percentile(real_values, [75, 25]))
+        else:
+            real_median = np.nan
+            real_iqr = np.nan
+            print(f"No valid real values for Volume ID: {volume_id}")
+
+        if len(pred_values) > 0:
+            pred_median = np.median(pred_values)
+            pred_iqr = np.subtract(*np.percentile(pred_values, [75, 25]))
+        else:
+            pred_median = np.nan
+            pred_iqr = np.nan
+            print(f"No valid predicted values for Volume ID: {volume_id}")
 
         results.append({
             'Volume_ID': volume_id,
